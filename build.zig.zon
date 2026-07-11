@@ -1,0 +1,13 @@
+.{
+    .name = .decache,
+    .version = "0.0.0",
+    .fingerprint = 0x3dc9b59be351cc05, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        //"README.md",
+    },
+}
