@@ -11,7 +11,9 @@ const usage =
     \\
     \\  -d, --dry-run    do not delete anything, only print what would be deleted and
     \\                   which pattern it matched
-    \\  -v, --verbose    print files and directories being deleted
+    \\  -v, --verbose    print files and directories being deleted, add more details
+    \\                   to dry-run
+    \\  -s, --summary    print amount of space freed
     \\  -h, --help       print this message and exit
     \\
 ;
@@ -44,6 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var dry_run = false;
     var verbose = false;
+    var summary = false;
     while (args.len != 0) : (args = args[1..]) {
         var arg = args[0];
         // Probably never gonna happen, but no reason to crash over it
@@ -62,6 +65,8 @@ pub fn main(init: std.process.Init) !u8 {
                     dry_run = true;
                 } else if (mem.eql(u8, arg, "verbose")) {
                     verbose = true;
+                } else if (mem.eql(u8, arg, "summary")) {
+                    summary = true;
                 } else if (mem.eql(u8, arg, "help")) {
                     try stdout.print(usage, .{prog_name});
                     return 0;
@@ -75,6 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
                     switch (char) {
                         'd' => dry_run = true,
                         'v' => verbose = true,
+                        's' => summary = true,
                         'h' => {
                             try stdout.print(usage, .{prog_name});
                             return 0;
@@ -111,18 +117,20 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const dir = Io.Dir.cwd().openDir(io, root_dir_path, .{ .iterate = true }) catch |err| {
-        stderr.print("Failed to open {s}: {t}\n", .{ root_dir_path, err }) catch {};
+        stderr.print("Failed to open '{s}': {t}\n", .{ root_dir_path, err }) catch {};
         return 1;
     };
     defer dir.close(io);
     var walker = try dir.walk(ally);
     defer walker.deinit();
 
+    const needs_size = verbose and dry_run or summary;
+    var total_size: u64 = 0;
     while (true) {
         const entry = walker.next(io) catch |err| switch (err) {
             error.OutOfMemory => break,
             else => {
-                const filename = walker.inner.name_buffer.items;
+                const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
                 stderr.print("Failed to read file or directory '{s}': {t}\n", .{ filename, err }) catch {};
                 stderr.flush() catch {};
                 continue;
@@ -131,8 +139,17 @@ pub fn main(init: std.process.Init) !u8 {
 
         const pattern = blk: for (patterns) |p| (if (p.matches(entry)) break :blk p) else null;
         if (pattern) |p| {
+            var size: u64 = 0;
+            if (needs_size) {
+                size = getItemSize(io, ally, entry.dir, entry.path, entry.basename, stderr) catch 0;
+                total_size +|= size;
+            }
             if (dry_run) {
-                try stdout.print("{s}: {s}\n", .{ p.full_string, entry.path });
+                if (verbose) {
+                    try stdout.print("{s} ({Bi:.1}): {s}\n", .{ p.full_string, size, entry.path });
+                } else {
+                    try stdout.print("{s}: {s}\n", .{ p.full_string, entry.path });
+                }
                 try stdout.flush();
             } else {
                 var print_verbose = true;
@@ -150,6 +167,14 @@ pub fn main(init: std.process.Init) !u8 {
             if (entry.kind == .directory) {
                 walker.leave(io);
             }
+        }
+    }
+
+    if (summary) {
+        if (dry_run) {
+            try stdout.print("Total size: {Bi:.1}\n", .{total_size});
+        } else {
+            try stdout.print("Total freed: {Bi:.1}\n", .{total_size});
         }
     }
 
@@ -195,3 +220,67 @@ const Pattern = struct {
         }
     }
 };
+
+fn getItemSize(
+    io: Io,
+    ally: Allocator,
+    parent: Io.Dir,
+    dir_path: []const u8,
+    sub_path: []const u8,
+    stderr: *Io.Writer,
+) !u64 {
+    const dir = parent.openDir(io, sub_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.NotDir => {
+            const file = parent.openFile(io, sub_path, .{ .path_only = true }) catch |err2| {
+                stderr.print("Failed to open file '{s}/{s}': {t}", .{ dir_path, sub_path, err2 }) catch {};
+                stderr.flush() catch {};
+                return 0;
+            };
+            const stat = file.stat(io) catch |err2| {
+                stderr.print("Failed to stat file '{s}/{s}': {t}", .{ dir_path, sub_path, err2 }) catch {};
+                stderr.flush() catch {};
+                return 0;
+            };
+            return stat.size;
+        },
+        else => {
+            stderr.print("Failed to open '{s}/{s}': {t}", .{ dir_path, sub_path, err }) catch {};
+            stderr.flush() catch {};
+            return 0;
+        },
+    };
+    defer dir.close(io);
+
+    var walker = try dir.walk(ally);
+    defer walker.deinit();
+
+    var size: u64 = 0;
+    while (true) {
+        const entry = walker.next(io) catch |err| switch (err) {
+            error.OutOfMemory => break,
+            else => {
+                const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
+                stderr.print("Failed to read file or directory '{s}/{s}': {t}\n", .{ dir_path, filename, err }) catch {};
+                stderr.flush() catch {};
+                continue;
+            },
+        } orelse break;
+
+        if (entry.kind == .file) {
+            const file = entry.dir.openFile(io, entry.basename, .{ .path_only = true }) catch |err| {
+                stderr.print("Failed to open file '{s}/{s}': {t}", .{ dir_path, sub_path, err }) catch {};
+                stderr.flush() catch {};
+                continue;
+            };
+            defer file.close(io);
+            const stat = file.stat(io) catch |err| {
+                stderr.print("Failed to stat file '{s}/{s}': {t}", .{ dir_path, sub_path, err }) catch {};
+                stderr.flush() catch {};
+                continue;
+            };
+            size +|= stat.size;
+        }
+    }
+
+    return size;
+}
