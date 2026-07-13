@@ -161,14 +161,11 @@ pub fn main(init: std.process.Init) !u8 {
     var skipped: u64 = 0;
     var deleted: u64 = 0;
     while (true) {
-        const entry = walker.next(io) catch |err| switch (err) {
-            error.OutOfMemory => break,
-            else => {
-                const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
-                stderr.print("Failed to read file or directory '{s}': {t}\n", .{ filename, err }) catch {};
-                stderr.flush() catch {};
-                continue;
-            },
+        const entry = walker.next(io) catch |err| {
+            const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
+            stderr.print("Failed to read file or directory '{s}': {t}\n", .{ filename, err }) catch {};
+            stderr.flush() catch {};
+            continue;
         } orelse break;
 
         const pattern = blk: for (patterns) |p| (if (p.matches(entry)) break :blk p) else null;
@@ -336,14 +333,11 @@ fn getItemSize(
 
     var size: u64 = 0;
     while (true) {
-        const entry = walker.next(io) catch |err| switch (err) {
-            error.OutOfMemory => break,
-            else => {
-                const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
-                stderr.print("Failed to read file or directory '{s}/{s}': {t}\n", .{ dir_path, filename, err }) catch {};
-                stderr.flush() catch {};
-                continue;
-            },
+        const entry = walker.next(io) catch |err| {
+            const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
+            stderr.print("Failed to read file or directory '{s}/{s}': {t}\n", .{ dir_path, filename, err }) catch {};
+            stderr.flush() catch {};
+            continue;
         } orelse break;
 
         if (entry.kind == .file) {
