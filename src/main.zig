@@ -11,8 +11,8 @@ const usage =
     \\
     \\  -d, --dry-run    do not delete anything, only print what would be deleted and
     \\                   which pattern it matched
-    \\  -v, --verbose    print files and directories being deleted, add more details
-    \\                   to dry-run
+    \\  -v, --verbose    print items being deleted, add more details to dry-run
+    \\  -a, --age <days> only delete items modified at least <days> ago
     \\  -s, --summary    print amount of space freed
     \\  -h, --help       print this message and exit
     \\
@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init) !u8 {
     var dry_run = false;
     var verbose = false;
     var summary = false;
+    var min_age: Io.Duration = .zero;
     while (args.len != 0) : (args = args[1..]) {
         var arg = args[0];
         // Probably never gonna happen, but no reason to crash over it
@@ -65,6 +66,20 @@ pub fn main(init: std.process.Init) !u8 {
                     dry_run = true;
                 } else if (mem.eql(u8, arg, "verbose")) {
                     verbose = true;
+                } else if (mem.eql(u8, arg, "age")) {
+                    if (args.len == 1) {
+                        stderr.writeAll("Option 'age' (--age) requires an argument\n") catch {};
+                        stderr.print(usage, .{prog_name}) catch {};
+                        return 1;
+                    }
+                    args = args[1..];
+                    const days_str = args[0];
+                    const days = std.fmt.parseInt(i32, days_str, 10) catch {
+                        stderr.print("Invalid age: '{s}'\n", .{days_str}) catch {};
+                        stderr.print(usage, .{prog_name}) catch {};
+                        return 1;
+                    };
+                    min_age = .fromSeconds(-days * std.time.s_per_day);
                 } else if (mem.eql(u8, arg, "summary")) {
                     summary = true;
                 } else if (mem.eql(u8, arg, "help")) {
@@ -76,10 +91,25 @@ pub fn main(init: std.process.Init) !u8 {
                     return 1;
                 }
             } else {
-                for (arg[1..]) |char| {
+                for (arg[1..], 0..) |char, i| {
                     switch (char) {
                         'd' => dry_run = true,
                         'v' => verbose = true,
+                        'a' => {
+                            if (args.len == 1 or i != arg.len - 2) {
+                                stderr.writeAll("Option 'age' (-a) requires an argument\n") catch {};
+                                stderr.print(usage, .{prog_name}) catch {};
+                                return 1;
+                            }
+                            args = args[1..];
+                            const days_str = args[0];
+                            const days = std.fmt.parseInt(i32, days_str, 10) catch {
+                                stderr.print("Invalid age: '{s}'\n", .{days_str}) catch {};
+                                stderr.print(usage, .{prog_name}) catch {};
+                                return 1;
+                            };
+                            min_age = .fromSeconds(-days * std.time.s_per_day);
+                        },
                         's' => summary = true,
                         'h' => {
                             try stdout.print(usage, .{prog_name});
@@ -124,8 +154,12 @@ pub fn main(init: std.process.Init) !u8 {
     var walker = try dir.walk(ally);
     defer walker.deinit();
 
+    const now = Io.Clock.real.now(io);
+    const delete_cutoff = now.addDuration(min_age);
     const needs_size = verbose and dry_run or summary;
     var total_size: u64 = 0;
+    var skipped: u64 = 0;
+    var deleted: u64 = 0;
     while (true) {
         const entry = walker.next(io) catch |err| switch (err) {
             error.OutOfMemory => break,
@@ -139,27 +173,73 @@ pub fn main(init: std.process.Init) !u8 {
 
         const pattern = blk: for (patterns) |p| (if (p.matches(entry)) break :blk p) else null;
         if (pattern) |p| {
+            var skip: enum { dont, too_young, cant_get_age } = .dont;
+            if (min_age.nanoseconds != 0) blk: {
+                const file = entry.dir.openFile(io, entry.basename, .{ .path_only = true }) catch |err| {
+                    stderr.print("Failed to determine age of '{s}': {t}", .{ entry.path, err }) catch {};
+                    stderr.flush() catch {};
+                    skip = .cant_get_age;
+                    break :blk;
+                };
+                const stat = file.stat(io) catch |err| {
+                    stderr.print("Failed to determine age of '{s}': {t}", .{ entry.path, err }) catch {};
+                    stderr.flush() catch {};
+                    skip = .cant_get_age;
+                    break :blk;
+                };
+                if (stat.mtime.nanoseconds > delete_cutoff.nanoseconds) {
+                    skip = .too_young;
+                }
+            }
+
             var size: u64 = 0;
             if (needs_size) {
                 size = getItemSize(io, ally, entry.dir, entry.path, entry.basename, stderr) catch 0;
-                total_size +|= size;
+                if (skip == .dont) {
+                    total_size +|= size;
+                }
             }
+
             if (dry_run) {
                 if (verbose) {
-                    try stdout.print("{s} ({Bi:.1}): {s}\n", .{ p.full_string, size, entry.path });
+                    try stdout.print("{s} ({Bi:.1}){s}: {s}\n", .{
+                        p.full_string,
+                        size,
+                        switch (skip) {
+                            .dont => "",
+                            .too_young => " (skipped, too young)",
+                            .cant_get_age => " (skipped, failed to get age)",
+                        },
+                        entry.path,
+                    });
                 } else {
-                    try stdout.print("{s}: {s}\n", .{ p.full_string, entry.path });
+                    try stdout.print("{s}{s}: {s}\n", .{
+                        p.full_string,
+                        if (skip != .dont) " (skipped)" else "",
+                        entry.path,
+                    });
                 }
+                if (skip != .dont) skipped += 1 else deleted += 1;
                 try stdout.flush();
             } else {
                 var print_verbose = true;
-                entry.dir.deleteTree(io, entry.basename) catch |err| {
-                    stderr.print("Failed to delete file or directory '{s}': {t}\n", .{ entry.path, err }) catch {};
-                    print_verbose = false;
-                    stderr.flush() catch {};
-                };
+                if (skip != .dont) blk: {
+                    entry.dir.deleteTree(io, entry.basename) catch |err| {
+                        stderr.print("Failed to delete file or directory '{s}': {t}\n", .{ entry.path, err }) catch {};
+                        print_verbose = false;
+                        stderr.flush() catch {};
+                        skipped += 1;
+                        break :blk;
+                    };
+                    deleted += 1;
+                } else {
+                    skipped += 1;
+                }
                 if (verbose and print_verbose) {
-                    try stdout.print("Deleted '{s}'\n", .{entry.path});
+                    try stdout.print("{s} '{s}'\n", .{
+                        if (skip != .dont) "Skipped" else "Deleted",
+                        entry.path,
+                    });
                     try stdout.flush();
                 }
             }
@@ -172,9 +252,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (summary) {
         if (dry_run) {
-            try stdout.print("Total size: {Bi:.1}\n", .{total_size});
+            try stdout.print("{d} matched, {d} skipped\tTotal size: {Bi:.1}\n", .{ deleted, skipped, total_size });
         } else {
-            try stdout.print("Total freed: {Bi:.1}\n", .{total_size});
+            try stdout.print("{d} deleted, {d} skipped\tTotal freed: {Bi:.1}\n", .{ deleted, skipped, total_size });
         }
     }
 
