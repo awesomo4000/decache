@@ -216,11 +216,11 @@ pub fn main(init: std.process.Init) !u8 {
                         entry.path,
                     });
                 }
-                if (skip != .dont) skipped += 1 else deleted += 1;
+                if (skip == .dont) deleted += 1 else skipped += 1;
                 try stdout.flush();
             } else {
                 var print_verbose = true;
-                if (skip != .dont) blk: {
+                if (skip == .dont) blk: {
                     entry.dir.deleteTree(io, entry.basename) catch |err| {
                         stderr.print("Failed to delete file or directory '{s}': {t}\n", .{ entry.path, err }) catch {};
                         print_verbose = false;
