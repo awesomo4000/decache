@@ -4,6 +4,12 @@ const Allocator = std.mem.Allocator;
 const mem = std.mem;
 const sep = Io.Dir.path.sep;
 
+const ArgsIterator = @import("ArgsIterator.zig");
+
+comptime {
+    std.testing.refAllDecls(ArgsIterator);
+}
+
 const usage =
     \\usage: {s} [options]... <directory> <pattern>...
     \\
@@ -13,6 +19,9 @@ const usage =
     \\                   which pattern it matched
     \\  -v, --verbose    print items being deleted, add more details to dry-run
     \\  -a, --age <days> only delete items modified at least <days> ago
+    \\  -S, --size <size>
+    \\                   only delete items at least <size> large, <size> is an integer
+    \\                   followed by an optional suffix [K|M|G|T]
     \\  -s, --summary    print amount of space freed
     \\  -h, --help       print this message and exit
     \\
@@ -35,112 +44,141 @@ pub fn main(init: std.process.Init) !u8 {
     const stderr = &stderr_writer.interface;
     defer stderr.flush() catch {};
 
-    var args = try init.minimal.args.toSlice(arena);
+    var args = try init.minimal.args.iterateAllocator(arena);
 
-    if (args.len == 0) {
+    const prog_name = args.next() orelse {
         stderr.writeAll("No program name somehow???\n") catch {};
         return 1;
-    }
-    const prog_name = args[0];
-    args = args[1..];
+    };
 
     var dry_run = false;
     var verbose = false;
     var summary = false;
     var min_age: Io.Duration = .zero;
-    while (args.len != 0) : (args = args[1..]) {
-        var arg = args[0];
-        // Probably never gonna happen, but no reason to crash over it
-        if (arg.len == 0) continue;
-        if (arg[0] == '-') {
-            // Just skip '-'
-            if (arg.len == 1) continue;
-            if (arg[1] == '-') {
-                arg = arg[2..];
-                if (arg.len == 0) {
-                    // '--' means options are done and all following strings
-                    // are treated as directory/patterns
-                    args = args[1..];
-                    break;
-                } else if (mem.eql(u8, arg, "dry-run")) {
-                    dry_run = true;
-                } else if (mem.eql(u8, arg, "verbose")) {
-                    verbose = true;
-                } else if (mem.eql(u8, arg, "age")) {
-                    if (args.len == 1) {
-                        stderr.writeAll("Option 'age' (--age) requires an argument\n") catch {};
-                        stderr.print(usage, .{prog_name}) catch {};
-                        return 1;
-                    }
-                    args = args[1..];
-                    const days_str = args[0];
-                    const days = std.fmt.parseInt(i32, days_str, 10) catch {
-                        stderr.print("Invalid age: '{s}'\n", .{days_str}) catch {};
-                        stderr.print(usage, .{prog_name}) catch {};
-                        return 1;
-                    };
-                    min_age = .fromSeconds(-days * std.time.s_per_day);
-                } else if (mem.eql(u8, arg, "summary")) {
-                    summary = true;
-                } else if (mem.eql(u8, arg, "help")) {
-                    try stdout.print(usage, .{prog_name});
-                    return 0;
+    var min_size: u64 = 0;
+
+    var maybe_root_dir_path: ?[]const u8 = null;
+    var patterns_list: std.ArrayList(Pattern) = .empty;
+    defer patterns_list.deinit(ally);
+
+    var args_iterator: ArgsIterator = .init(args);
+    while (args_iterator.next()) |arg_str| {
+        const Arg = enum {
+            dry_run,
+            verbose,
+            age,
+            size,
+            summary,
+            help,
+
+            unknown,
+        };
+        const arg: Arg = switch (arg_str) {
+            .option_long => |value|
+            // zig fmt: off
+                if (value.len == 0) break // options are done on "--"
+                else if (mem.eql(u8, value, "dry-run")) .dry_run
+                else if (mem.eql(u8, value, "verbose")) .verbose
+                else if (mem.eql(u8, value, "age"))     .age
+                else if (mem.eql(u8, value, "size"))    .size
+                else if (mem.eql(u8, value, "summary")) .summary
+                else if (mem.eql(u8, value, "help"))    .help
+                else .unknown,
+            // zig fmt: on
+            .option_short => |value| switch (value) {
+                'd' => .dry_run,
+                'v' => .verbose,
+                'a' => .age,
+                'S' => .size,
+                's' => .summary,
+                'h' => .help,
+                else => .unknown,
+            },
+            .argument => |value| {
+                if (maybe_root_dir_path == null) {
+                    maybe_root_dir_path = value;
                 } else {
-                    stderr.print("Unrecognised option: {s}\n", .{arg}) catch {};
+                    try patterns_list.append(ally, .init(value));
+                }
+                continue;
+            },
+        };
+
+        switch (arg) {
+            .dry_run => dry_run = true,
+            .verbose => verbose = true,
+            .summary => summary = true,
+            .age => {
+                const maybe_argument = args_iterator.next();
+                if (maybe_argument == null or maybe_argument.? != .argument) {
+                    stderr.print("Option 'age' ({f}) requires an argument\n", .{arg_str}) catch {};
                     stderr.print(usage, .{prog_name}) catch {};
                     return 1;
                 }
-            } else {
-                for (arg[1..], 0..) |char, i| {
-                    switch (char) {
-                        'd' => dry_run = true,
-                        'v' => verbose = true,
-                        'a' => {
-                            if (args.len == 1 or i != arg.len - 2) {
-                                stderr.writeAll("Option 'age' (-a) requires an argument\n") catch {};
-                                stderr.print(usage, .{prog_name}) catch {};
-                                return 1;
-                            }
-                            args = args[1..];
-                            const days_str = args[0];
-                            const days = std.fmt.parseInt(i32, days_str, 10) catch {
-                                stderr.print("Invalid age: '{s}'\n", .{days_str}) catch {};
-                                stderr.print(usage, .{prog_name}) catch {};
-                                return 1;
-                            };
-                            min_age = .fromSeconds(-days * std.time.s_per_day);
-                        },
-                        's' => summary = true,
-                        'h' => {
-                            try stdout.print(usage, .{prog_name});
-                            return 0;
-                        },
-                        else => {
-                            stderr.print("Unrecognised option: -{c}\n", .{char}) catch {};
-                            stderr.print(usage, .{prog_name}) catch {};
-                            return 1;
-                        },
-                    }
+
+                const days_str = maybe_argument.?.argument;
+                const days = std.fmt.parseInt(i32, days_str, 10) catch {
+                    stderr.print("Invalid age: '{s}'\n", .{days_str}) catch {};
+                    stderr.print(usage, .{prog_name}) catch {};
+                    return 1;
+                };
+
+                min_age = .fromSeconds(@as(i64, -days) * std.time.s_per_day);
+            },
+            .size => {
+                const maybe_argument = args_iterator.next();
+                if (maybe_argument == null or maybe_argument.? != .argument) {
+                    stderr.print("Option 'size' ({f}) requires an argument\n", .{arg_str}) catch {};
+                    stderr.print(usage, .{prog_name}) catch {};
+                    return 1;
                 }
-            }
-        } else break;
+
+                var size_str = maybe_argument.?.argument;
+                const multiplier: u64 = switch (size_str[size_str.len - 1]) {
+                    'K', 'k' => 1024,
+                    'M', 'm' => 1024 * 1024,
+                    'G', 'g' => 1024 * 1024 * 1024,
+                    'T', 't' => 1024 * 1024 * 1024 * 1024,
+                    else => 1,
+                };
+                if (multiplier != 1) size_str = size_str[0 .. size_str.len - 1];
+
+                const size = std.fmt.parseInt(u64, size_str, 10) catch {
+                    stderr.print("Invalid size: '{s}'\n", .{size_str}) catch {};
+                    stderr.print(usage, .{prog_name}) catch {};
+                    return 1;
+                };
+
+                min_size = size *| multiplier;
+            },
+            .help => {
+                try stdout.print(usage, .{prog_name});
+                return 0;
+            },
+            .unknown => {
+                stderr.print("Unrecognised option: '{f}'\n", .{arg_str}) catch {};
+                stderr.print(usage, .{prog_name}) catch {};
+                return 1;
+            },
+        }
     }
 
-    if (args.len == 0) {
+    // handle stuff after a potential "--"
+    while (args_iterator.inner.next()) |arg| {
+        if (maybe_root_dir_path == null) {
+            maybe_root_dir_path = arg;
+        } else {
+            try patterns_list.append(ally, .init(arg));
+        }
+    }
+
+    const root_dir_path = maybe_root_dir_path orelse {
         try stdout.print(usage, .{prog_name});
         return 1;
-    }
-    const root_dir_path = args[0];
-    args = args[1..];
-
-    const patterns = blk: {
-        var slice = try arena.alloc(Pattern, args.len);
-        for (args, 0..) |arg, i| {
-            slice[i] = .init(arg);
-        }
-        args = args[args.len..];
-        break :blk slice;
     };
+
+    const patterns = try patterns_list.toOwnedSlice(ally);
+    defer ally.free(patterns);
     if (patterns.len == 0) {
         try stdout.print(usage, .{prog_name});
         return 1;
@@ -156,7 +194,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const now = Io.Clock.real.now(io);
     const delete_cutoff = now.addDuration(min_age);
-    const needs_size = verbose and dry_run or summary;
+    const needs_size = verbose and dry_run or summary or min_size != 0;
     var total_size: u64 = 0;
     var skipped: u64 = 0;
     var deleted: u64 = 0;
@@ -170,16 +208,16 @@ pub fn main(init: std.process.Init) !u8 {
 
         const pattern = blk: for (patterns) |p| (if (p.matches(entry)) break :blk p) else null;
         if (pattern) |p| {
-            var skip: enum { dont, too_young, cant_get_age } = .dont;
+            var skip: enum { dont, too_young, cant_get_age, too_small, cant_get_size } = .dont;
             if (min_age.nanoseconds != 0) blk: {
                 const file = entry.dir.openFile(io, entry.basename, .{ .path_only = true }) catch |err| {
-                    stderr.print("Failed to determine age of '{s}': {t}", .{ entry.path, err }) catch {};
+                    stderr.print("Failed to determine age of '{s}': {t}\n", .{ entry.path, err }) catch {};
                     stderr.flush() catch {};
                     skip = .cant_get_age;
                     break :blk;
                 };
                 const stat = file.stat(io) catch |err| {
-                    stderr.print("Failed to determine age of '{s}': {t}", .{ entry.path, err }) catch {};
+                    stderr.print("Failed to determine age of '{s}': {t}\n", .{ entry.path, err }) catch {};
                     stderr.flush() catch {};
                     skip = .cant_get_age;
                     break :blk;
@@ -191,7 +229,19 @@ pub fn main(init: std.process.Init) !u8 {
 
             var size: u64 = 0;
             if (needs_size) {
-                size = getItemSize(io, ally, entry.dir, entry.path, entry.basename, stderr) catch 0;
+                size = getItemSize(io, ally, entry.dir, entry.path, entry.basename, stderr, min_size != 0) catch |err| blk: {
+                    if (min_size != 0) {
+                        stderr.print("Failed to get size of '{s}': {t}\n", .{ entry.path, err }) catch {};
+                        stderr.flush() catch {};
+                        skip = .cant_get_size;
+                    }
+                    break :blk 0;
+                };
+
+                if (skip == .dont and size < min_size) {
+                    skip = .too_small;
+                }
+
                 if (skip == .dont) {
                     total_size +|= size;
                 }
@@ -206,6 +256,8 @@ pub fn main(init: std.process.Init) !u8 {
                             .dont => "",
                             .too_young => " (skipped, too young)",
                             .cant_get_age => " (skipped, failed to get age)",
+                            .too_small => " (skipped, too small)",
+                            .cant_get_size => " (skipped, failed get size)",
                         },
                         entry.path,
                     });
@@ -305,25 +357,26 @@ fn getItemSize(
     dir_path: []const u8,
     sub_path: []const u8,
     stderr: *Io.Writer,
+    important: bool,
 ) !u64 {
     const dir = parent.openDir(io, sub_path, .{ .iterate = true }) catch |err| switch (err) {
         error.NotDir => {
             const file = parent.openFile(io, sub_path, .{ .path_only = true }) catch |err2| {
                 stderr.print("Failed to open file '{s}/{s}': {t}", .{ dir_path, sub_path, err2 }) catch {};
                 stderr.flush() catch {};
-                return 0;
+                return if (important) err2 else 0;
             };
             const stat = file.stat(io) catch |err2| {
                 stderr.print("Failed to stat file '{s}/{s}': {t}", .{ dir_path, sub_path, err2 }) catch {};
                 stderr.flush() catch {};
-                return 0;
+                return if (important) err2 else 0;
             };
             return stat.size;
         },
         else => {
             stderr.print("Failed to open '{s}/{s}': {t}", .{ dir_path, sub_path, err }) catch {};
             stderr.flush() catch {};
-            return 0;
+            return if (important) err else 0;
         },
     };
     defer dir.close(io);
@@ -337,20 +390,20 @@ fn getItemSize(
             const filename = walker.inner.name_buffer.items[0 .. walker.inner.name_buffer.items.len - 1];
             stderr.print("Failed to read file or directory '{s}/{s}': {t}\n", .{ dir_path, filename, err }) catch {};
             stderr.flush() catch {};
-            continue;
+            if (important) return err else continue;
         } orelse break;
 
         if (entry.kind == .file) {
             const file = entry.dir.openFile(io, entry.basename, .{ .path_only = true }) catch |err| {
                 stderr.print("Failed to open file '{s}/{s}': {t}", .{ dir_path, sub_path, err }) catch {};
                 stderr.flush() catch {};
-                continue;
+                if (important) return err else continue;
             };
             defer file.close(io);
             const stat = file.stat(io) catch |err| {
                 stderr.print("Failed to stat file '{s}/{s}': {t}", .{ dir_path, sub_path, err }) catch {};
                 stderr.flush() catch {};
-                continue;
+                if (important) return err else continue;
             };
             size +|= stat.size;
         }
