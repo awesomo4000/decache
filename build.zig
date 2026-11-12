@@ -23,9 +23,7 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Check that the program compiles");
     check_step.dependOn(&exe.step);
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,

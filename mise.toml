@@ -1,0 +1,11 @@
+[tools]
+zig = "0.17.1"
+
+[tasks.build]
+run = "zig build"
+
+[tasks.test]
+run = "zig build test --summary all"
+
+[tasks.check]
+run = "zig build check"

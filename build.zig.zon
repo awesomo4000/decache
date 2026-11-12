@@ -2,7 +2,7 @@
     .name = .decache,
     .version = "0.1.0",
     .fingerprint = 0x3dc9b59be351cc05, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .paths = .{
         "build.zig",
         "build.zig.zon",
